@@ -127,11 +127,20 @@ async def query(q: Query):
     if answer is None:
         return abstain()
 
-    # Put the passages the LLM actually used first, then fill with best-retrieved ones.
+    # Rerank: passages the LLM actually used come first (so a confounder never
+    # outranks the true source), then the rest by similarity. Scores stay descending.
     used = [int(i) for i in out.get("used", []) if str(i).isdigit() and 0 <= int(i) < len(KB)]
-    picked = list(dict.fromkeys(used + order))[:k]
-    picked.sort(key=lambda i: -sims[i])          # must be descending by score
-    scores = [round(float(min(1.0, max(0.0, sims[i]))), 4) for i in picked]
+    used = sorted(set(used), key=lambda i: -sims[i])
+    rest = [i for i in order if i not in used]
+    picked = (used + rest)[:k]
+    rerank = {i: min(1.0, 0.6 + 0.4 * float(max(0.0, sims[i]))) for i in used}
+    floor = min(rerank.values()) if rerank else 1.0
+    scores = []
+    for i in picked:
+        s = rerank[i] if i in rerank else min(float(max(0.0, sims[i])), floor - 0.01)
+        if scores:
+            s = min(s, scores[-1])                 # enforce descending
+        scores.append(round(max(0.0, s), 4))
 
     conf = float(out.get("confidence", 0.85) or 0.85)
     return {
