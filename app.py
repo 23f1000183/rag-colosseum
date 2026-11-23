@@ -24,7 +24,6 @@ from pydantic import BaseModel
 BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://aipipe.org/openai/v1").rstrip("/")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-3-small")
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4.1-mini")
-CANDIDATES = 8          # passages shown to the LLM
 ABSTAIN_SIM = 0.20      # below this best-similarity we abstain without asking the LLM
 
 KB = json.loads((Path(__file__).parent / "knowledge_base.json").read_text(encoding="utf-8"))
@@ -78,7 +77,7 @@ async def kb_emb() -> np.ndarray:
     return KB_EMB
 
 
-SYSTEM = """You answer questions ONLY from the numbered passages given to you.
+SYSTEM = """You answer questions ONLY from the 50 numbered PASSAGES listed at the end of this message.
 Rules:
 - The passages are the sole source of truth. Their numbers may differ from real-world facts; always use the passage value.
 - Watch for confounders: similar topics (e.g. Raft vs Multi-Paxos, SGD vs AdamW, Postgres vs MySQL) have different values. Use the passage about the exact subject asked.
@@ -98,16 +97,18 @@ Rules:
 Reply with JSON only: {"answer": "<short answer with the exact value and unit, or null>", "used": [passage numbers you used], "confidence": <0-1>}"""
 
 
-async def ask_llm(question: str, idx: list[int]) -> dict:
-    ctx = "\n\n".join(f"[{i}] {KB[i]}" for i in idx)
+KB_BLOCK = "\n\n".join(f"[{i}] {p}" for i, p in enumerate(KB))
+
+
+async def ask_llm(question: str) -> dict:
     r = await api_post("/chat/completions", {
         "model": CHAT_MODEL,
         "temperature": 0,
         "max_tokens": 150,
         "response_format": {"type": "json_object"},
         "messages": [
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": f"Passages:\n{ctx}\n\n<question>\n{question}\n</question>"},
+            {"role": "system", "content": SYSTEM + "\n\nPASSAGES:\n" + KB_BLOCK},
+            {"role": "user", "content": f"<question>\n{question}\n</question>"},
         ],
     })
     r.raise_for_status()
@@ -143,20 +144,23 @@ async def query(q: Query):
 async def _query(q: Query):
     k = max(1, min(int(q.top_k or 3), 50))
     q = Query(question=clean(q.question), top_k=k)
-    try:
-        kbv, qv = await asyncio.gather(kb_emb(), embed([q.question]))
-        qv = qv[0]
-    except Exception:
-        return abstain()
-    sims = kbv @ qv
-    order = [int(i) for i in np.argsort(-sims)]
-    if sims[order[0]] < ABSTAIN_SIM:
-        return abstain()
+    async def safe_llm():
+        try:
+            return await asyncio.wait_for(ask_llm(q.question), 7.0)
+        except Exception:
+            return {"answer": None, "used": [], "confidence": 0.1}
 
-    try:
-        out = await asyncio.wait_for(ask_llm(q.question, order[:CANDIDATES]), 6.5)
-    except Exception:
-        out = {"answer": None, "used": [], "confidence": 0.1}
+    async def safe_emb():
+        try:
+            kbv, qv = await asyncio.gather(kb_emb(), embed([q.question]))
+            return kbv @ qv[0]
+        except Exception:
+            return None
+
+    out, sims = await asyncio.gather(safe_llm(), safe_emb())
+    if sims is None:
+        sims = np.zeros(len(KB), dtype=np.float32)
+    order = [int(i) for i in np.argsort(-sims)]
 
     answer = out.get("answer")
     if isinstance(answer, str) and (not answer.strip() or answer.strip().lower() in {"null", "none", "unknown"}):
