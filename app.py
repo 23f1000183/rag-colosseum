@@ -105,6 +105,12 @@ def abstain():
 
 @app.post("/query")
 async def query(q: Query):
+    res = await _query(q)
+    print("PROBE " + json.dumps({"q": q.question, "k": q.top_k, "r": res}), flush=True)
+    return res
+
+
+async def _query(q: Query):
     k = max(1, min(int(q.top_k or 3), 50))
     try:
         kbv, qv = await asyncio.gather(kb_emb(), embed([q.question]))
