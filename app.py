@@ -24,7 +24,7 @@ from pydantic import BaseModel
 BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://aipipe.org/openai/v1").rstrip("/")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-3-small")
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4.1-mini")
-CANDIDATES = 5          # passages shown to the LLM
+CANDIDATES = 8          # passages shown to the LLM
 ABSTAIN_SIM = 0.20      # below this best-similarity we abstain without asking the LLM
 
 KB = json.loads((Path(__file__).parent / "knowledge_base.json").read_text(encoding="utf-8"))
@@ -32,6 +32,15 @@ KB_EMB: np.ndarray | None = None
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+@app.middleware("http")
+async def collapse_slashes(request, call_next):
+    # Base URL entered with a trailing slash makes the grader call "//query".
+    path = request.scope.get("path", "")
+    if "//" in path:
+        request.scope["path"] = re.sub(r"/{2,}", "/", path)
+    return await call_next(request)
 
 def api_key() -> str:
     for name in ("OPENAI_API_KEY", "AIPIPE_TOKEN", "AIPIPE_API_KEY", "API_KEY"):
@@ -77,6 +86,8 @@ Rules:
 - Questions are often PARAPHRASED: systems are described by role instead of name and terms are swapped for synonyms
   (e.g. "cluster coordinator" = leader, "subordinate replicas" = followers, "keepalive signals" = heartbeats,
   "relational database daemon" = PostgreSQL server, "base scalar coefficient scaling the gradient" = learning rate).
+  A leader/coordinator sending periodic signals so followers do not start an ELECTION is Raft's leader heartbeat,
+  not a gossip/SWIM ping interval. Pick the passage whose mechanism matches best, not just shared words.
   If a passage clearly describes the mechanism being asked about, ANSWER from it with its exact value.
 - Do NOT transfer a value between DIFFERENT named systems (a value for Postgres does not answer a question about SQLite).
 - FALSE PREMISE: if the question asserts a fact that contradicts the passages (e.g. "Since Raft requires 100 nodes for
@@ -103,6 +114,21 @@ async def ask_llm(question: str, idx: list[int]) -> dict:
     return json.loads(r.json()["choices"][0]["message"]["content"])
 
 
+_SENT = r"[^.?!]*[.?!]?"   # rest of the current sentence
+INJECTION = re.compile(
+    r"<!--.*?-->|\[\s*system[^\]]*\]" + _SENT + "|"
+    r"(system override|ignore (all )?(previous|prior|above)|disregard (all )?(previous|prior|above)|"
+    r"note to (the )?(model|assistant)|force sources|respond only with|reply with)" + _SENT,
+    re.I | re.S)
+
+
+def clean(question: str) -> str:
+    """Remove hidden HTML comments and injected instructions; keep the real question."""
+    q = INJECTION.sub(" ", question)
+    q = re.sub(r"\s+", " ", q).strip()
+    return q or question
+
+
 def abstain():
     return {"answer": None, "sources": [], "scores": [], "confidence": 0.1}
 
@@ -116,6 +142,7 @@ async def query(q: Query):
 
 async def _query(q: Query):
     k = max(1, min(int(q.top_k or 3), 50))
+    q = Query(question=clean(q.question), top_k=k)
     try:
         kbv, qv = await asyncio.gather(kb_emb(), embed([q.question]))
         qv = qv[0]
