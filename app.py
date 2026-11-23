@@ -22,7 +22,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://aipipe.org/openai/v1").rstrip("/")
-API_KEY = os.environ.get("OPENAI_API_KEY", "")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-3-small")
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4.1-mini")
 CANDIDATES = 6          # passages shown to the LLM
@@ -34,12 +33,20 @@ KB_EMB: np.ndarray | None = None
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-client = httpx.AsyncClient(
-    base_url=BASE_URL,
-    headers={"Authorization": f"Bearer {API_KEY}"},
-    timeout=httpx.Timeout(7.0),
-    limits=httpx.Limits(max_connections=50),
-)
+def api_key() -> str:
+    for name in ("OPENAI_API_KEY", "AIPIPE_TOKEN", "AIPIPE_API_KEY", "API_KEY"):
+        v = os.environ.get(name, "").strip().strip('"').strip("'")
+        if v:
+            return v
+    return ""
+
+
+async def api_post(path: str, payload: dict) -> httpx.Response:
+    # New client per call: Vercel runs each request in a fresh event loop,
+    # so a shared AsyncClient fails with "Event loop is closed".
+    async with httpx.AsyncClient(timeout=httpx.Timeout(7.0)) as c:
+        return await c.post(BASE_URL + path, json=payload,
+                            headers={"Authorization": f"Bearer {api_key()}"})
 
 
 class Query(BaseModel):
@@ -48,22 +55,17 @@ class Query(BaseModel):
 
 
 async def embed(texts: list[str]) -> np.ndarray:
-    r = await client.post("/embeddings", json={"model": EMBED_MODEL, "input": texts})
+    r = await api_post("/embeddings", {"model": EMBED_MODEL, "input": texts})
     r.raise_for_status()
     v = np.array([d["embedding"] for d in r.json()["data"]], dtype=np.float32)
     return v / np.linalg.norm(v, axis=1, keepdims=True)
-
-
-_lock = asyncio.Lock()
 
 
 async def kb_emb() -> np.ndarray:
     """Embed the KB once per server instance (lazy, so it works on Vercel serverless)."""
     global KB_EMB
     if KB_EMB is None:
-        async with _lock:
-            if KB_EMB is None:
-                KB_EMB = await embed(KB)
+        KB_EMB = await embed(KB)
     return KB_EMB
 
 
@@ -79,7 +81,7 @@ Reply with JSON only: {"answer": "<short answer with the exact value and unit, o
 
 async def ask_llm(question: str, idx: list[int]) -> dict:
     ctx = "\n\n".join(f"[{i}] {KB[i]}" for i in idx)
-    r = await client.post("/chat/completions", json={
+    r = await api_post("/chat/completions", {
         "model": CHAT_MODEL,
         "temperature": 0,
         "response_format": {"type": "json_object"},
@@ -138,3 +140,16 @@ async def query(q: Query):
 @app.get("/")
 def health():
     return {"ok": True, "passages": len(KB)}
+
+
+@app.get("/debug")
+async def debug():
+    """Shows whether the API key works (never shows the key itself)."""
+    info = {"base_url": BASE_URL, "key_set": bool(api_key()), "key_length": len(api_key())}
+    try:
+        r = await api_post("/embeddings", {"model": EMBED_MODEL, "input": ["test"]})
+        info["embeddings_status"] = r.status_code
+        info["embeddings_reply"] = r.text[:300] if r.status_code != 200 else "ok"
+    except Exception as e:
+        info["embeddings_error"] = repr(e)[:300]
+    return info
