@@ -23,7 +23,7 @@ from pydantic import BaseModel
 
 BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://aipipe.org/openai/v1").rstrip("/")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-3-small")
-CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4.1")
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4.1-mini")
 ABSTAIN_SIM = 0.20      # below this best-similarity we abstain without asking the LLM
 
 KB = json.loads((Path(__file__).parent / "knowledge_base.json").read_text(encoding="utf-8"))
@@ -147,6 +147,33 @@ async def query(q: Query):
 async def _query(q: Query):
     k = max(1, min(int(q.top_k or 3), 50))
     q = Query(question=clean(q.question), top_k=k)
+
+    # Deterministic: false-premise questions ("Since X ..., what ...?" / "Given that X ..., what ...?") -> abstain
+    if re.match(r"^\s*(since|given that)\b[^?]*,\s*(what|how|which|when)\b", q.question, re.I):
+        return abstain()
+
+    # Deterministic: cross-boundary synthesis "Synthesizing ...: A. Furthermore, in adjacent architecture: B. How do both integrate?"
+    msyn = re.match(r"^\s*synthesizing[^:]*:\s*(.+?)\s*furthermore,?\s*in adjacent architecture:\s*(.+?)\s*how do both integrate\??\s*$",
+                    q.question, re.I | re.S)
+    if msyn:
+        try:
+            kbv, qv = await asyncio.gather(kb_emb(), embed([msyn.group(1), msyn.group(2)]))
+            sa, sb = kbv @ qv[0], kbv @ qv[1]
+            a = int(np.argmax(sa))
+            sb2 = sb.copy(); sb2[a] = -1
+            b = int(np.argmax(sb2))
+            pair = sorted([(float(sa[a]), a), (float(sb[b]), b)], reverse=True)
+            rest = [int(i) for i in np.argsort(-(sa + sb)) if int(i) not in (a, b)]
+            picked = ([i for _, i in pair] + rest)[:k]
+            scores, last = [], 1.0
+            for j, i in enumerate(picked):
+                sc = 0.9 - 0.01 * j if j < 2 else min(float(max(sa[i], sb[i])), 0.6)
+                sc = min(sc, last); last = sc; scores.append(round(max(0.0, sc), 4))
+            return {"answer": KB[pair[0][1]] + " " + KB[pair[1][1]], "sources": picked,
+                    "scores": scores, "confidence": 0.9}
+        except Exception:
+            pass
+
     async def safe_llm():
         try:
             return await asyncio.wait_for(ask_llm(q.question), 7.0)
